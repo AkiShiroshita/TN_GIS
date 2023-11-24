@@ -1,0 +1,847 @@
+---
+title: "Tennessee GIS"
+format: 
+  html: 
+    theme: zephyr
+    self-contained: true
+editor: visual
+author: "Aki Shiroshita"
+date: "`r Sys.time()`"
+toc: true
+bibliography: references.bib
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+#devtools::install_github('rstudio/leaflet')  # for 'terra::plet' function
+#devtools::install_github("josephlewis/leastcostpath")
+#devtools::install_github("r-spatial/mapview")
+# devtools::install_github("heli-xu/findSVI")
+
+packages = c("here",
+             "readr",
+             "readxl",
+             "tidyverse",
+             "tidylog",
+             "lubridate",
+             "ggplot2",
+             "RColorBrewer",
+             "ggplotgui",
+             "sf",
+             "terra",
+             "leaflet",
+             "raster",
+             "geodata",
+             "rnaturalearth",
+             "car",
+             "ggspatial",
+             "tidyterra",
+             "adehabitatHR",
+             "alphahull",
+             "concaveman",
+             "gstat",
+             "automap",
+             "CoordinateCleaner",
+             "sdmpredictors",
+             "fuzzySim",
+             "cartogram",
+             "leastcostpath",
+             "mapview",
+             "tidycensus",
+             "findSVI",
+             "tigris",
+             "patchwork",
+             "showtext",
+             "glue",
+             "furrr",
+             "ggiraph",
+             "survey",
+             "srvyr",
+             "tidygeocoder", # tcu <- geo("TCU, Fort Worth TX")
+             "rgeoda",
+             "showtext",
+             "scales",
+             "tableone",
+             "survey") 
+
+#install.packages("spDataLarge", repos = "https://nowosad.r-universe.dev")
+package.check <- lapply(packages, FUN = function(x){
+  if (!require(x, character.only = TRUE)){
+    install.packages(x, dependencies = TRUE)
+    library(x, character.only = TRUE)
+  }
+})
+
+options(tigris_use_cache = TRUE)
+census_api_key("d59d1e5f29303f4db592c0f11059666b0a9a5d10", overwrite = TRUE)
+
+# mapview: https://r-spatial.github.io/mapview/articles/mapview_02-advanced.html
+```
+
+## Research questions
+
+Our focus is on the Tennessee state.
+
+-   Are there any distinct characteristics of areas where there are many people who are covered by Medicaid?
+
+Comment: Using PUMAs data  
+
+-   Were areas where there are many people without vehicles located close to highways and have high-level exposures to PM$_{2.5}$, NO$_2$, and Ozone, regardless of race/ethnicity?
+
+Comment: Using ACS data 
+
+-   Was there any difference in change of the number of children from 2000 to 2020 among the Child Opportunity Index (COI) categories? Was there any improvement of the COI in each area and what were the area-level predictors for the improvement?
+
+## Tennessee boundaries
+
+Download boundary shapefiles into R. GEOID is the unique ID for each census block: "State ID + County ID + Census Tract ID + Census Block Group ID + Census Block ID"
+
+Several notes
+
+-   Boundaries of metro/micropolitan areas are compatible with the census boundaries while Public Use Microdata Areas \[PUMAs\] is not.  
+
+-   For small areas (e.g., Census tracts and block groups), the geographies change over time, thus areal interpolation (e.g., population interpolation) is needed to adjust data from one year to the geographies of the other year.  
+
+-   The issue of differential privacy should be taken into account in the 2020 Census data. It was implemented to ensure respondent privacy, that is infusing noise into the data, particularly for small areas. It means that counts for small areas may not be entirely accurate. We should aggregate up block data into custom regions.  
+
+-   Geocoding: Google is the most accurate but we cannot access for free and handling is not easy. Open Street Geocoder is free but not so accurate.
+
+```{r}
+tn_tracts <- tracts(state = "TN",
+                    year = 2022,
+                    progress_bar = FALSE)
+
+tn_counties <- counties(state="TN",
+                        year = 2022,
+                        progress_bar = FALSE)
+```
+
+```{r}
+mapview(tn_tracts)
+```
+
+## The Decennial Census
+
+The Decennial Census was coducted in 2000, 2010, and 2020 (every ten years).
+
+In 2020, we may use the following files.
+
+-   "dhc" file: The Demographic and Housing Characteristics File (9,000 variables on household structure, race / ethnicity, and age)
+
+-   "dp" file: The Demographic Profile file (320 pre-computed variables such as count and percentage)
+
+-   "pl" file: Redistricting data
+
+-   "pes" file: Post enumeration survey
+
+```{r}
+summary_files(year=2020)
+#dhc <- load_variables(year = 2020, dataset = "dhc")
+#View(dhc)
+#dp <- load_variables(year = 2020, dataset = "dp")
+#View(dp)
+```
+
+```{r}
+child_count2020 <- get_decennial(
+  geography = "tract",
+  variables = c(child_count2020 = "DP1_0120C"), # child (count): DP1_0120C
+  state = "TN",
+  year = 2020,
+  sumfile = "dp",
+  output = "wide",
+  geometry = TRUE
+)
+
+child_count2020_summary <- child_count2020 %>% 
+  separate_wider_delim(cols = NAME, delim = "; ",
+                       names = c("Census tract", "County", "State")) %>% 
+  mutate(County = str_sub(County, end = -8)) %>% 
+  summarize(median_child = median(child_count2020, na.rm = TRUE),
+            .by = County) %>% 
+  mutate(year = 2020)
+```
+
+In 2010 and 2000 data, there was no "dhc" file. Instead, 2000 has "sf1", "sf2", "sf3" that is summary files. The "sf3" file was now included in the American Community Survey (ACS).
+
+On the other hand, 2010 does not have "sf3" file, but it was contained in the "sf1" file.
+
+-   "sf1": Same as the "dhc" file
+
+-   "sf3": Census long-form, or sample survey (e.g., income and education)
+
+```{r}
+summary_files(year=2000)
+#sf1 <- load_variables(year = 2000, dataset = "sf1")
+#View(sf1)
+#sf3 <- load_variables(year = 2000, dataset = "sf3")
+#View(sf3)
+```
+
+```{r}
+summary_files(year=2010)
+#sf1 <- load_variables(year = 2010, dataset = "sf1")
+#View(sf1)
+```
+
+Just illustrating declining birthrate across all the counties in TN.
+
+```{r}
+child_count2010 <- get_decennial(
+  geography = "tract",
+  variables = c(bio_child_count = "P029008", # biological 
+                adop_child_count = "P029009", # adopted
+                step_child_count = "P029010", # stepchild
+                grand_child_count = "P029011"), # grandchild 
+  state = "TN",
+  year = 2010,
+  sumfile = "sf1",
+  output = "wide",
+  geometry = TRUE
+)
+
+child_count2010_summary <- child_count2010 %>% 
+  separate_wider_delim(cols = NAME, delim = ", ",
+                       names = c("Census tract", "County", "State")) %>% 
+  mutate(child_count = bio_child_count + adop_child_count + step_child_count + grand_child_count,
+         County = str_sub(County, end = -8)) %>% 
+  summarize(median_child = median(child_count, na.rm = TRUE),
+            .by = County) %>% 
+  mutate(median_child= -1*median_child,
+         year = 2010)
+
+child_count_summary <- bind_rows(child_count2010_summary, child_count2020_summary)
+```
+
+```{r}
+# caution: the number of census tracts in each county would be different
+
+ggplot(child_count_summary, aes(x = median_child, y = County,
+       fill = factor(year))) +
+  geom_col(width = 0.95, alpha = 0.75) +
+  theme_minimal(base_size = 6) +
+  scale_x_continuous(labels = function(x) paste0(abs(x), "")) +
+  scale_fill_manual(values = c("black", "orange")) +
+  labs(x = "Number of children at each county, 2010 and 2020 Census",
+       y = "",
+       color = "Year") +
+  guides(fill=guide_legend(title="Year"))
+```
+
+Age distribution
+
+```{r}
+age_plot <- function(county) {
+  ages <- c(0:99, rep(100, 3))
+  
+  male_vars <- paste0("PCT012", str_pad(3:105, 3, "left", "0"))
+  female_vars <- paste0("PCT012", 107:209)
+  
+  names(male_vars) <- ages
+  names(female_vars) <- ages
+  
+  all_vars <- c(male_vars, female_vars)
+  
+  
+  pull00 <- get_decennial(
+    geography = "county",
+    state = "TN",
+    county = county,
+    variables = all_vars,
+    year = 2000
+  ) %>%
+    summarize(value = sum(value, na.rm = TRUE), 
+              .by = variable) %>%
+    mutate(year = "2000")
+  
+  pull10 <- get_decennial(
+    geography = "county",
+    state = "TN",
+    county = county,
+    variables = all_vars,
+    year = 2010
+  ) %>%
+    summarize(value = sum(value, na.rm = TRUE), 
+              .by = variable) %>%
+    mutate(year = "2010")
+  
+  male_vars20 <- paste0("PCT12_", str_pad(3:105, 3, "left", "0"), "N")
+  female_vars20 <- paste0("PCT12_", 107:209, "N")
+  
+  names(male_vars20) <- ages
+  names(female_vars20) <- ages
+  
+  all_vars20 <- c(male_vars20, female_vars20)
+  
+  
+  pull20 <- get_decennial(
+    geography = "county",
+    state = "TN",
+    county = county,
+    variables = all_vars20,
+    year = 2020,
+    sumfile = "dhc"
+  ) %>%
+    summarize(value = sum(value, na.rm = TRUE), 
+              .by = variable) %>%
+    mutate(year = "2020")
+  
+  all_years <- bind_rows(pull00, pull10, pull20)
+  
+  ggplot(all_years, aes(x = as.numeric(variable), y = value, color = year,
+                        group = year)) + 
+    geom_line() + 
+    theme_minimal() + 
+    scale_color_brewer(palette = "Set1") + 
+    scale_y_continuous(labels = scales::label_comma()) + 
+    labs(y = "Population",
+         x = "Single-year age",
+         color = "Year",
+         title = glue::glue("Age distributions in {county}"))
+}
+```
+
+```{r}
+age_plot("Davidson") 
+
+# iteration
+#plan("multisession")
+#names(counties) <- counties
+#state_plots <- future_map(states, age_plot)
+```
+
+```{r}
+age_plot("Shelby")
+```
+
+```{r}
+age_plot("Jackson")
+```
+
+```{r}
+age_plot("Campbell")
+```
+
+Interpolation in small areas
+
+Specify whether you want a spatially intensive or extensive method. If it is intensive `extensive = FALSE`, the mean is preserved; this is what we want for rates, percentages, or other derived statistics. If it is extensive `extensive = TRUE`, the sum is preserved; this is what we want for count data.
+
+```{r}
+child_count2010_plot <- child_count2010 %>% 
+  separate_wider_delim(cols = NAME, delim = ", ",
+                       names = c("Census tract", "County", "State")) %>% 
+  mutate(child_count2010 = bio_child_count + adop_child_count + step_child_count + grand_child_count,
+         County = str_sub(County, end = -8)) %>% 
+  st_as_sf()
+```
+
+```{r}
+#breaks <- c(0, 2000, 4000, 6000, 8000, 10000)
+breaks <- c(0, 1000, 2000, 3000, 4000, 5000,
+            6000, 7000, 8000, 9000, 10000)
+
+mapview(child_count2010_plot, at = breaks, 
+        zcol = "child_count2010", layer.name = "Number of children") | 
+  mapview(child_count2020, at = breaks, 
+          zcol = "child_count2020", legend = FALSE)
+```
+
+```{r}
+w_blocks <- blocks(
+  state = "TN",
+  year = 2020
+)
+
+child_count2010_to_2020 <- interpolate_pw(
+  from = child_count2010_plot,
+  to = child_count2020,
+  to_id = "GEOID",
+  extensive = TRUE,
+  weights = w_blocks,
+  weight_column = "POP20",
+  crs = 6576
+)
+```
+
+```{r}
+merged <- child_count2010_to_2020 %>%
+  left_join(st_drop_geometry(child_count2020), by = "GEOID") %>%
+  mutate(shift = child_count2020 - child_count2010)
+
+breaks <- c(-2000, -1500, -1000, -500, 0, 500, 1000)
+
+labels <- c("-2000 or less",
+            "-2000 to -1500",
+            "-1500 to -1000",
+            "-1000 to -500",
+            "-500 to 0",
+            "0 to 500",
+            "500 to 1000",
+            "1000 or more")
+
+colors <- RColorBrewer::brewer.pal(10, "RdYlBu")[c(1:9)]
+
+m <- mapview::mapview(merged, zcol = "shift", at = breaks, legend = TRUE,
+                      col.regions = colors,
+                      layer.name = "Shift in number of children (2010 to 2020 Census)")
+m
+```
+
+Regionalization
+
+Regionalization algorithms combine nearby spatial units with similar characteristics to form larger units. This can be a useful solution to the differential privacy / aggregation problem; we can generate regions that are smaller than block groups, but still have larger populations to reduce error.
+
+[RESCAP algorithm](https://geodacenter.github.io/workbook/9c_spatial3/lab9c.html#redcap)
+
+```
+davidson_blocks <- get_decennial(
+  geography = "block",
+  variables = c(
+    total_pop = "P1_001N",
+    white = "P5_003N"
+  ),
+  state = "TN",
+  county = "Davidson",
+  geometry = TRUE,
+  year = 2020,
+  sumfile = "dhc",
+  output = "wide"
+) 
+
+davidson_bgs <- get_decennial(
+  geography = "block group",
+  variables = c(
+    total_pop = "P1_001N",
+    white = "P5_003N"
+  ),
+  state = "TN",
+  county = "Davidson",
+  geometry = TRUE,
+  year = 2020,
+  sumfile = "dhc",
+  output = "wide"
+) 
+```
+
+```
+davidson_blocks <- davidson_blocks %>%
+  mutate(percent_white = 100 * (white / total_pop),
+         percent_white = ifelse(is.na(percent_white), 0, percent_white))
+
+w <- rook_weights(davidson_blocks)
+regions <- redcap(k = 25, w = w,
+                  df = davidson_blocks["percent_white"],
+                  bound_variable = davidson_blocks["total_pop"],
+                  random_seed = 2023,
+                  min_bound = 50)
+
+davidson_blocks$region <- as.character(regions$Cluster)
+
+mapview(davidson_blocks, zcol = "region",
+        col.regions = RColorBrewer::brewer.pal(9, "Set1"),
+        legend = FALSE)
+```
+
+```
+davidson_dissolved <- davidson_blocks %>%
+  group_by(region) %>%
+  summarize(
+    total = sum(total_pop, na.rm = TRUE),
+    white = sum(white, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(white_pct = 100 * (white / total))
+
+mapview(davidson_dissolved, zcol = "region",
+        col.regions = RColorBrewer::brewer.pal(9, "Set1"),
+        legend = FALSE)
+```
+
+## American Community Survey
+
+ACS: Sent to a sample of addresses every month, every year. Data were averaged over 5 years (moving average). Contains the margins of error (MOE), so the decennial census data would be more accurate.
+
+```{r}
+#load_variables(2017, "acs5", cache = TRUE)
+#acs1 <- load_variables(2017, "acs1", cache = TRUE) # no vehicle: B25044_003 (category) and C25045_003 (binary)
+#view(acs1)
+tn_acs <- get_acs(geography = "tract",
+                  variables = c(vehicle_category = "B25044_003",
+                                race_total = "B02001_001",
+                                black = "B02001_003",
+                                white = "B02001_002"),
+                  state = "TN",
+                  year = 2021,
+                  output = "wide") # recent average: 2017-2021
+
+tn_acs <- tn_acs %>% 
+  mutate(black_pct = 100*(blackE/race_totalE),
+         white_pct = 100*(whiteE/race_totalE))
+```
+
+```{r}
+scatter <- ggplot(tn_acs, aes(x = black_pct, y = vehicle_categoryE, 
+                                         size = race_totalE, tooltip = NAME,
+                                         data_id = GEOID)) + 
+  geom_point_interactive(alpha = 0.75) + 
+  theme_minimal() +
+  scale_size_continuous(labels = label_comma()) + 
+  labs(x = "% Black population",
+       y = "Number of vehicles",
+       size = "Total population")
+
+girafe(ggobj = scatter,
+       options = list(
+         opts_hover(css = "fill:blue;stroke:red;"),
+         opts_zoom(min = 0.5, max = 3)
+       ))
+```
+
+```{r}
+scatter <- ggplot(tn_acs, aes(x = white_pct, y = vehicle_categoryE, 
+                                         size = race_totalE, tooltip = NAME,
+                                         data_id = GEOID)) + 
+  geom_point_interactive(alpha = 0.75) + 
+  theme_minimal() +
+  scale_size_continuous(labels = label_comma()) + 
+  labs(x = "% White population",
+       y = "Number of vehicles",
+       size = "Total population")
+
+girafe(ggobj = scatter,
+       options = list(
+         opts_hover(css = "fill:blue;stroke:red;"),
+         opts_zoom(min = 0.5, max = 3)
+       ))
+```
+
+Area-level socioeconomic deprivation indices: They are not interchangeable [@rollings2023].
+
+-   Area Deprivation Index (ADI; University of Wisconsin) [@singh2003a]
+
+*Census block level*
+
+17 U.S. census indicators of income, education, employment, and housing quality
+
+Variables: Educational distribution (percentage of the population with less than 9 years and with 12 or more years of education), median family income, income disparity, occupational composition, unemployment rate, family poverty rate, percentage of the population below 150% of the poverty rate, single-parent household rate, home ownership rate, median home value, median gross rent, median monthly mortgage, and household crowding, percentages of households without access to a telephone, plumbing, or motor vehicles; English language proficiency; divorce rate; percentage of urban population; and percentage of immigrant population.
+
+Factor analysis and principal-component analysis were conducted.
+
+Each indicator is multiplied by its factor score coefficient and then summed within each block group. Poverty, income, and education are weighted most heavily among the 17 items. The resulting sums are then converted into a standardized index via arbitrarily setting the index mean at 100 and standard deviation at 20. The ADI national percentile rankings of block groups range from 0 to 100, with 100 being the greatest level of deprivation. Decile rankings are also available for individual states. The ADI is not released as raw scores and instructs users to apply ADI in rank-type format.
+
+We can download data from [here](https://www.neighborhoodatlas.medicine.wisc.edu/).
+
+-   Social Vulnerability Index (SVI; Centers for Disease Control and Prevention, CDC) [@flanagan2011]
+
+*Census tract level*
+
+"Resilience of communities when confronted by external stresses on human health, stresses such as natural or human-caused disasters, or disease outbreaks."
+
+15 U.S. census indicators of within four themes: socioeconomic status (SES), household composition and disability, minority status and language, and housing type and transportation
+
+Percentile rankings of all 15 items are calculated for individual items, the four themes, and a geographic unit's overall ranking. Individual item percentiles are summed for each theme and within each geographic unit. Summed percentiles are then ordered to identify theme-specific percentile rankings. For each of the 4 themes, percentiles of individual items within each theme are summed.
+
+We can download data from [here](https://www.atsdr.cdc.gov/placeandhealth/svi/index.html).
+
+[GitHub](https://github.com/azh2/Social-Vulnerability-R)
+
+```
+summarise_results <- find_svi(
+  year = c(2017, 2018),
+  state = c("TN", "TN"),
+  geography = "county"
+)
+summarise_results %>% 
+  group_by(year, state) %>% 
+  slice_head(n = 5)
+```
+
+
+-   Child Opportunity Index (COI): Children's healthy development index at the census tract level
+
+*Census tract level*
+
+29 U.S. census indicators of three domains (education, health, and environment, social and economic)
+
+Variables: Early childhood education (ECE centers within five miles, high-quality ECE centers within five miles, ECE enrollment), primary school (third-grade reading proficiency, third-grade math proficiency), secondary and post-secondary (high school graduation rates, AP enrollment, college access/enrollment), resources (school poverty, teacher experience, adult education attainment), healthy environments (access to healthy food, access to green space, walkability, housing vacancy rates), toxic exposures (superfund sites, industrial pollutants, microparticles, ozone, heat), health insurance coverage, Economic opportunities (employment rate, commute duration), economic resourceindex (poverty rate, public assistance rate, high skill employment, median household income, home ownership), and single parenthood
+
+Standardized indicators are weighted-averaged into three domain scores, and further weighted-averaged into one overall score. Scores converted into Child Opportunity Scores and Child Opportunity Levels.
+
+Child Opportunity Scores: 1 to 100, ranking all neighborhoods on domain and overall scores Grouped neighborhoods into 100 groups containing 1% of the child population each, and assigned each group a score from 1 (lowest) to 100 (highest)
+
+Child Opportunity Levels: 5 categories (very low, low, moderate, high, very high), ranking all neighborhoods on domain average or overall average z-scores Grouped neighborhoods into 5 categories containing 20% of the child population each
+
+We can download data from [here](https://data.diversitydatakids.org/dataset/coi20-child-opportunity-index-2-0-database/resource/080cfe52-90aa-4925-beaa-90efb04ab7fb)
+
+Notes:
+
+-   COI: focused on stractural features of neighborhoods that shape opportunities for children growing up; SVI, ADI: mainly captures the sociodemographic characteristics of the population living there
+
+-   SVI may be more useful for larger geographic areas because it focuses on the county level while ADI is better for targeting smaller areas because it includes data at the level of neighborhoods, but lacks data on race/ethnicity
+
+## Public Use Microdata Areas
+
+PUMAs: Individual-level responses to the ACS rather than aggregating to certain geographic levels (tract, county, state, etc.).
+
+PUMS data is a sample of about 1% of the US population. When we want to estimate a variable that represents the entire population rather than a sample, we have to apply a weighting adjustment. ([details](https://usa.ipums.org/usa/repwt.shtml#q10))  
+
+```{r}
+tn_pumas2021 <- pumas(state = "TN", year = 2021) %>% 
+  dplyr::select(PUMACE10, geometry)
+tn_pumas2017 <- pumas(state = "TN", year = 2017) %>% 
+  dplyr::select(PUMACE10, geometry)
+#st_join(x=tn_pumas, y=tn_counties, largest = TRUE) # return the largest overlap
+```
+
+`pums_variables` is a dataset built into tidycensus that contains names, descriptions, codes, and other metadata about the PUMS variables.
+
+```{r}
+pums_vars_2021_acs1 <- pums_variables %>% 
+  filter(year == 2021, survey == "acs1") %>% 
+  distinct(var_code, var_label, data_type, level) # filter(level == "person"), filter(level == "housing")
+# gas cost, fuel cost, medicaid, other insurances, vehicles
+
+pums_vars_2021_acs5 <- pums_variables %>% 
+  filter(year == 2021, survey == "acs5") %>% 
+  distinct(var_code, var_label, data_type, level) 
+
+pums_vars_2017_acs5 <- pums_variables %>% 
+  filter(year == 2017, survey == "acs5") %>% 
+  distinct(var_code, var_label, data_type, level) 
+```
+
+Housing units are uniquely identified by the `SERIALNO` variable and persons are uniquely identified by the combination of `SERIALNO` and `SPORDER`.
+
+[Data dictionary](https://api.census.gov/data/2019/acs/acs1/pums/variables.html)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+pums_data_tn_2021 <- get_pums(
+  variables = c("PUMA",
+                "HINS4", # medicaid
+                "NP", # numner of person in the household
+                "RACBLK", # black
+                "RACWHT", # white
+                "VEH", # vehicle
+                "HINCP", # household income
+                "HUPAC" # presence and age of children
+                ),
+  state = "TN",
+  survey = "acs5",
+  year = 2021, 
+  rep_weights = "person"
+)
+
+pums_data_tn_2021 <- pums_data_tn_2021 %>% 
+  mutate(HINS4 = if_else(HINS4=="2", "0", HINS4),
+         vehicle_binary = case_when(VEH == "-1" ~ NA_character_,
+                                    VEH == "0" ~ "0",
+                                    VEH == "1" | VEH == "2" |
+                                      VEH == "3" | VEH == "4" |
+                                      VEH == "5" | VEH == "6" ~ "1"),
+         vehicle_count = if_else(VEH == "-1", NA_character_, VEH),
+         child06 = case_when(HUPAC == "0" ~ NA_character_,
+                             HUPAC == "1" | HUPAC == "3" ~ "1",
+                             HUPAC == "4" | HUPAC == "2" ~ "0"),
+         child017 = case_when(HUPAC == "0" ~ NA_character_,
+                              HUPAC == "1" | HUPAC == "2" |
+                               HUPAC == "3" ~ "1",
+                             HUPAC == "4" ~ "0"))
+
+pums_data_tn_2021_summary <- pums_data_tn_2021 %>%
+  summarize(medicare_count = sum(as.numeric(HINS4), na.rm = TRUE),
+            total_pop = n(),
+            total_black = sum(as.numeric(RACBLK), na.rm = TRUE),
+            total_white = sum(as.numeric(RACWHT), na.rm = TRUE),
+            .by = "PUMA") %>% 
+  mutate(medicare_pct = 100*medicare_count/total_pop,
+         black_pct = 100*total_black/total_pop,
+         white_pct = 100*total_white/total_pop)
+
+pums_data_tn_2021_summary_sf <- left_join(pums_data_tn_2021_summary, tn_pumas2021,
+                                     by = c("PUMA" = "PUMACE10")) %>% 
+  st_as_sf()
+```
+
+```{r}
+pums_data_tn_2017 <- get_pums(
+  variables = c("PUMA",
+                "HINS4", # medicaid
+                "NP", # numner of person in the household
+                "RACBLK", # black
+                "RACWHT", # white
+                "VEH", # vehicle
+                "HINCP", # household income
+                "HUPAC" # presence and age of children
+                ), 
+  state = "TN",
+  survey = "acs5",
+  year = 2017
+)
+
+pums_data_tn_2017 <- pums_data_tn_2017 %>% 
+  mutate(HINS4 = if_else(HINS4=="2", "0", HINS4),
+         vehicle_binary = case_when(VEH == "-1" ~ NA_character_,
+                                    VEH == "0" ~ "0",
+                                    VEH == "1" | VEH == "2" |
+                                      VEH == "3" | VEH == "4" |
+                                      VEH == "5" | VEH == "6" ~ "1"),
+         vehicle_count = if_else(VEH == "-1", NA_character_, VEH),
+         child06 = case_when(HUPAC == "0" ~ NA_character_,
+                             HUPAC == "1" | HUPAC == "3" ~ "1",
+                             HUPAC == "4" | HUPAC == "2" ~ "0"),
+         child017 = case_when(HUPAC == "0" ~ NA_character_,
+                              HUPAC == "1" | HUPAC == "2" |
+                               HUPAC == "3" ~ "1",
+                             HUPAC == "4" ~ "0"))
+
+pums_data_tn_2017_summary <- pums_data_tn_2017 %>%
+  summarize(medicare_count = sum(as.numeric(HINS4), na.rm = TRUE),
+            total_pop = n(),
+            total_black = sum(as.numeric(RACBLK), na.rm = TRUE),
+            total_white = sum(as.numeric(RACWHT), na.rm = TRUE),
+            .by = "PUMA") %>% 
+  mutate(medicare_pct = 100*medicare_count/total_pop,
+         black_pct = 100*total_black/total_pop,
+         white_pct = 100*total_white/total_pop)
+
+pums_data_tn_2017_summary_sf <- left_join(pums_data_tn_2017_summary, tn_pumas2021,
+                                     by = c("PUMA" = "PUMACE10")) %>% 
+  st_as_sf()
+```
+
+```{r}
+breaks <- c(0, 400, 800, 1200, 1600, 2000, 2400)
+mapview(pums_data_tn_2017_summary_sf, at = breaks, 
+        zcol = "medicare_count", layer.name = "Number of Medicaid coverages") | 
+  mapview(pums_data_tn_2021_summary_sf, at = breaks, 
+          zcol = "medicare_count", legend = FALSE)
+```
+
+```{r}
+breaks <- c(0, 10, 20, 30, 40, 50)
+mapview(pums_data_tn_2017_summary_sf, at = breaks, 
+        zcol = "medicare_pct", layer.name = "% Medicaid coverages") | 
+  mapview(pums_data_tn_2021_summary_sf, at = breaks, 
+          zcol = "medicare_pct", legend = FALSE)
+```
+
+We can find how to calculate the sampling weight [here](https://walker-data.com/tidycensus/articles/pums-data.html)
+
+Weighted statistics  
+
+```{r}
+sum(pums_data_tn_2021$PWGTP)
+sum(pums_data_tn_2017$PWGTP)
+```
+
+```{r}
+pums_data_tn_2021_summary <- pums_data_tn_2021 %>%
+  group_by(PUMA) %>% 
+  summarize(total_pop = sum(PWGTP),
+            medicare_count = sum(PWGTP[HINS4 > 0]),
+            medicare_pct = 100*medicare_count/total_pop)
+
+pums_data_tn_2021_summary_sf <- left_join(pums_data_tn_2021_summary, tn_pumas2021,
+                                     by = c("PUMA" = "PUMACE10")) %>% 
+  st_as_sf()
+```
+
+```{r}
+pums_data_tn_2017_summary <- pums_data_tn_2017 %>%
+  group_by(PUMA) %>% 
+  summarize(total_pop = sum(PWGTP),
+            medicare_count = sum(PWGTP[HINS4 > 0]),
+            medicare_pct = 100*medicare_count/total_pop)
+
+pums_data_tn_2017_summary_sf <- left_join(pums_data_tn_2017_summary, tn_pumas2017,
+                                     by = c("PUMA" = "PUMACE10")) %>% 
+  st_as_sf()
+```
+
+```{r}
+breaks <- c(0, 500, 1000, 15000, 20000, 25000, 30000, 35000, 40000, 45000)
+mapview(pums_data_tn_2017_summary_sf, at = breaks, 
+        zcol = "medicare_count", layer.name = "Number of Medicaid coverages") | 
+  mapview(pums_data_tn_2021_summary_sf, at = breaks, 
+          zcol = "medicare_count", legend = FALSE)
+```
+
+```{r}
+breaks <- c(0, 10, 20, 30, 40, 50)
+mapview(pums_data_tn_2017_summary_sf, at = breaks, 
+        zcol = "medicare_pct", layer.name = "% Medicaid coverages") | 
+  mapview(pums_data_tn_2021_summary_sf, at = breaks, 
+          zcol = "medicare_pct", legend = FALSE)
+```
+
+```{r}
+top10_vec <- pums_data_tn_2021_summary_sf %>%
+  arrange(desc(medicare_count)) %>% 
+  head(10) %>% 
+  as.data.frame() %>% 
+  dplyr::select(PUMA) %>% 
+  pull()
+
+pums_data_tn_2021 <- pums_data_tn_2021 %>% 
+  mutate(top10 = if_else(PUMA %in% top10_vec, 1, 0))
+
+down10_vec <- pums_data_tn_2021_summary_sf %>% 
+  arrange(medicare_count) %>% 
+  head(10) %>% 
+  as.data.frame() %>% 
+  dplyr::select(PUMA) %>% 
+  pull()
+
+pums_data_tn_2021 <- pums_data_tn_2021 %>% 
+  mutate(down10 = if_else(PUMA %in% down10_vec, 1, 0))
+```
+
+Areal characteristics  
+
+```{r}
+svy_data <- pums_data_tn_2021 %>% 
+  filter(top10 == 1 | down10== 1)
+
+data_design <- to_survey(svy_data,
+                           type = "person",
+                           class = "survey",
+                           design = "rep_weights")
+
+vars <- c("vehicle_binary", 
+          "vehicle_count", 
+          "child06", 
+          "child017")
+factorVars <- c("vehicle_binary",
+                "child06")
+
+
+table_one <- svyCreateTableOne(vars = vars, 
+                               factorVars = factorVars,
+                               strata = "top10", 
+                               data = data_design)
+table_one
+```
+
+## Individual data
+
+```
+tcu_5km <- tcu_sf %>%
+  st_buffer(5000)
+
+mapview(tcu_5km) + mapview(tcu_sf)
+
+block_pop_tcu <- get_decennial(
+  geography = "block",
+  variables = "P1_001N",
+  state = "TX",
+  county = "Tarrant",
+  geometry = TRUE,
+  filter_by = tcu_5km,
+  sumfile = "dhc",
+  year = 2020
+) 
+# In tidycensus 1.4.2:
+# Install with remotes::install_github("walkerke/tidycensus")
+sum(block_pop_tcu$value)
+```
